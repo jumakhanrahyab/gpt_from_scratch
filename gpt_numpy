@@ -1,0 +1,603 @@
+# nano_gpt_numpy_from_scratch.py
+# Pure NumPy nano-GPT (char-level) with a tiny autograd engine (Tensor) — NO PyTorch.
+#
+# What you get:
+# - Tiny Shakespeare char-level tokenizer (stoi/itos)
+# - batching (B,T)
+# - a 1-block GPT: token+pos embeddings -> (pre-LN) attention -> MLP -> vocab head
+# - cross-entropy training (end-to-end) using our autograd engine
+# - text generation
+#
+# Notes:
+# - This is intentionally small + readable.
+# - It’s not optimized for speed; it’s for learning and correctness.
+# - Default hyperparams are tiny; you can scale up later.
+
+import numpy as np
+
+# -----------------------------
+# 0) Repro + config
+# -----------------------------
+SEED = 1337
+rng = np.random.default_rng(SEED)
+
+# Data / batching
+block_size = 64     # context length (T)
+batch_size = 32     # batch size (B)
+train_split = 0.9
+
+# Model
+n_embd = 64         # embedding dim (C)
+mlp_mult = 4        # MLP expansion
+n_layers = 1        # keep 1 for learning (you can stack later)
+
+# Training
+steps = 3000
+lr = 1e-2
+eval_every = 500
+gen_new_tokens = 400
+
+# -----------------------------
+# 1) Load data + tokenize
+# -----------------------------
+with open("tiny_shakespeare.txt", "r", encoding="utf-8") as f:
+    text = f.read()
+
+chars = sorted(list(set(text)))
+vocab_size = len(chars)
+
+stoi = {ch: i for i, ch in enumerate(chars)}
+itos = {i: ch for i, ch in enumerate(chars)}
+encode = lambda s: [stoi[c] for c in s]
+decode = lambda ids: "".join(itos[i] for i in ids)
+
+data = np.array(encode(text), dtype=np.int64)
+n = int(train_split * len(data))
+train_data = data[:n]
+val_data = data[n:]
+
+
+def get_batch(split: str):
+    d = train_data if split == "train" else val_data
+    # make sure we can take (block_size+1)
+    ix = rng.integers(0, len(d) - block_size - 1, size=(batch_size,))
+    x = np.stack([d[i : i + block_size] for i in ix], axis=0)                 # (B,T)
+    y = np.stack([d[i + 1 : i + block_size + 1] for i in ix], axis=0)         # (B,T)
+    return x, y
+
+
+# -----------------------------
+# 2) Tiny autograd engine
+# -----------------------------
+def _unbroadcast(grad, shape):
+    # If grad has extra leading dims, sum them out
+    while len(grad.shape) > len(shape):
+        grad = grad.sum(axis=0)
+    # For dims that were broadcast (size 1), sum along that axis
+    for i, (gdim, sdim) in enumerate(zip(grad.shape, shape)):
+        if sdim == 1 and gdim != 1:
+            grad = grad.sum(axis=i, keepdims=True)
+    return grad
+
+
+class Tensor:
+    def __init__(self, data, _children=(), _op="", requires_grad=True):
+        self.data = np.array(data, dtype=np.float32)
+        self.grad = np.zeros_like(self.data, dtype=np.float32) if requires_grad else None
+        self._backward = lambda: None
+        self._prev = set(_children)
+        self._op = _op
+        self.requires_grad = requires_grad
+
+    def __repr__(self):
+        return f"Tensor(shape={self.data.shape}, op={self._op})"
+
+    # --- core ops (broadcast-safe) ---
+    def __add__(self, other):
+        other = other if isinstance(other, Tensor) else Tensor(other, requires_grad=False)
+        out = Tensor(self.data + other.data, (self, other), _op="+")
+
+        def _backward():
+            if self.grad is not None:
+                self.grad += _unbroadcast(out.grad, self.data.shape)
+            if other.grad is not None:
+                other.grad += _unbroadcast(out.grad, other.data.shape)
+
+        out._backward = _backward
+        return out
+
+    def __mul__(self, other):
+        other = other if isinstance(other, Tensor) else Tensor(other, requires_grad=False)
+        out = Tensor(self.data * other.data, (self, other), _op="*")
+
+        def _backward():
+            if self.grad is not None:
+                self.grad += _unbroadcast(other.data * out.grad, self.data.shape)
+            if other.grad is not None:
+                other.grad += _unbroadcast(self.data * out.grad, other.data.shape)
+
+        out._backward = _backward
+        return out
+
+    def __matmul__(self, other):
+        other = other if isinstance(other, Tensor) else Tensor(other, requires_grad=False)
+        out = Tensor(self.data @ other.data, (self, other), _op="@")
+
+        def _backward():
+            if self.grad is not None:
+                self.grad += out.grad @ other.data.T
+            if other.grad is not None:
+                other.grad += self.data.T @ out.grad
+
+        out._backward = _backward
+        return out
+
+    def reshape(self, *shape):
+        out = Tensor(self.data.reshape(*shape), (self,), _op="reshape")
+
+        def _backward():
+            if self.grad is not None:
+                self.grad += out.grad.reshape(self.data.shape)
+
+        out._backward = _backward
+        return out
+
+    def transpose(self, axes):
+        out = Tensor(np.transpose(self.data, axes), (self,), _op="transpose")
+
+        def _backward():
+            if self.grad is not None:
+                inv = np.argsort(axes)
+                self.grad += np.transpose(out.grad, inv)
+
+        out._backward = _backward
+        return out
+
+    def sum(self, axis=None, keepdims=False):
+        out = Tensor(self.data.sum(axis=axis, keepdims=keepdims), (self,), _op="sum")
+
+        def _backward():
+            if self.grad is not None:
+                g = out.grad
+                if axis is None:
+                    self.grad += g * np.ones_like(self.data, dtype=np.float32)
+                else:
+                    # expand g back
+                    if not keepdims:
+                        g = np.expand_dims(g, axis=axis)
+                    self.grad += g * np.ones_like(self.data, dtype=np.float32)
+
+        out._backward = _backward
+        return out
+
+    def mean(self):
+        out = Tensor(self.data.mean(), (self,), _op="mean")
+
+        def _backward():
+            if self.grad is not None:
+                self.grad += out.grad * np.ones_like(self.data, dtype=np.float32) / self.data.size
+
+        out._backward = _backward
+        return out
+
+    def exp(self):
+        out = Tensor(np.exp(self.data), (self,), _op="exp")
+
+        def _backward():
+            if self.grad is not None:
+                self.grad += np.exp(self.data) * out.grad
+
+        out._backward = _backward
+        return out
+
+    def log(self):
+        out = Tensor(np.log(self.data), (self,), _op="log")
+
+        def _backward():
+            if self.grad is not None:
+                self.grad += (1.0 / self.data) * out.grad
+
+        out._backward = _backward
+        return out
+
+    def backward(self):
+        topo = []
+        visited = set()
+
+        def build(v):
+            if v not in visited:
+                visited.add(v)
+                for child in v._prev:
+                    build(child)
+                topo.append(v)
+
+        build(self)
+        if self.grad is None:
+            raise ValueError("This Tensor does not require gradients.")
+        self.grad = np.ones_like(self.data, dtype=np.float32)
+        for v in reversed(topo):
+            v._backward()
+
+
+def softmax_tensor(logits: Tensor, axis=-1):
+    # stable softmax; we subtract max using numpy (treat as constant shift)
+    m = np.max(logits.data, axis=axis, keepdims=True)
+    shifted = Tensor(logits.data - m, (logits,), _op="shift")
+
+    def _backward_shift():
+        if logits.grad is not None:
+            logits.grad += shifted.grad
+
+    shifted._backward = _backward_shift
+
+    ex = shifted.exp()
+    denom = Tensor(np.sum(ex.data, axis=axis, keepdims=True), (ex,), _op="sum_keepdims")
+
+    def _backward_denom():
+        if ex.grad is not None:
+            ex.grad += denom.grad * np.ones_like(ex.data, dtype=np.float32)
+
+    denom._backward = _backward_denom
+
+    out = Tensor(ex.data / denom.data, (ex, denom), _op="softmax")
+
+    def _backward_softmax():
+        if ex.grad is not None:
+            ex.grad += out.grad / denom.data
+        if denom.grad is not None:
+            denom.grad += _unbroadcast((-ex.data * out.grad) / (denom.data ** 2), denom.data.shape)
+
+    out._backward = _backward_softmax
+    return out
+
+
+def cross_entropy_tensor(logits_2d: Tensor, targets: np.ndarray):
+    """
+    logits_2d: Tensor (N,V)
+    targets: np array (N,) int
+    returns: scalar Tensor loss
+    """
+    probs = softmax_tensor(logits_2d, axis=1)  # (N,V)
+    N = targets.shape[0]
+
+    # gather p_correct with custom backward
+    p = probs.data[np.arange(N), targets]
+    p_t = Tensor(p, (probs,), _op="gather")
+
+    def _backward_gather():
+        if probs.grad is not None:
+            gp = np.zeros_like(probs.data, dtype=np.float32)
+            gp[np.arange(N), targets] = p_t.grad
+            probs.grad += gp
+
+    p_t._backward = _backward_gather
+
+    loss = (p_t.log() * Tensor(-1.0, requires_grad=False)).mean()
+    return loss
+
+
+# -----------------------------
+# 3) Model building blocks
+# -----------------------------
+def randn(shape, scale=0.02):
+    return (scale * rng.standard_normal(shape)).astype(np.float32)
+
+
+def layer_norm_tensor(x: Tensor, gamma: Tensor, beta: Tensor, eps=1e-5):
+    # forward using numpy stats; backward uses standard LN formula
+    X = x.data
+    mean = X.mean(axis=-1, keepdims=True)
+    var = ((X - mean) ** 2).mean(axis=-1, keepdims=True)
+    std = np.sqrt(var + eps)
+    xhat = (X - mean) / std
+    out = Tensor(xhat * gamma.data + beta.data, (x, gamma, beta), _op="layernorm")
+
+    def _backward():
+        if x.grad is None:
+            return
+        dy = out.grad
+        g = gamma.data
+        N = X.shape[-1]
+
+        # grads gamma/beta
+        if gamma.grad is not None:
+            gamma.grad += np.sum(dy * xhat, axis=tuple(range(dy.ndim - 1)))
+        if beta.grad is not None:
+            beta.grad += np.sum(dy, axis=tuple(range(dy.ndim - 1)))
+
+        dxhat = dy * g
+        dvar = np.sum(dxhat * (X - mean) * (-0.5) * (std ** -3), axis=-1, keepdims=True)
+        dmean = np.sum(dxhat * (-1.0 / std), axis=-1, keepdims=True) + dvar * np.mean(
+            -2.0 * (X - mean), axis=-1, keepdims=True
+        )
+        dx = dxhat * (1.0 / std) + dvar * (2.0 * (X - mean) / N) + dmean * (1.0 / N)
+        x.grad += dx
+
+    out._backward = _backward
+    return out
+
+
+def gelu_tensor(x: Tensor):
+    # GELU tanh approximation with custom backward
+    X = x.data
+    a = np.sqrt(2.0 / np.pi)
+    u = a * (X + 0.044715 * X ** 3)
+    t = np.tanh(u)
+    out_data = 0.5 * X * (1.0 + t)
+    out = Tensor(out_data, (x,), _op="gelu")
+
+    def _backward():
+        if x.grad is None:
+            return
+        sech2 = 1.0 - t * t
+        du = a * (1.0 + 3.0 * 0.044715 * X ** 2)
+        d = 0.5 * (1.0 + t) + 0.5 * X * sech2 * du
+        x.grad += out.grad * d
+
+    out._backward = _backward
+    return out
+
+
+def causal_self_attention_tensor(x: Tensor, Wq: Tensor, Wk: Tensor, Wv: Tensor, Wo: Tensor):
+    B, T, C = x.data.shape
+
+    q = x @ Wq
+    k = x @ Wk
+    v = x @ Wv
+
+    kt = k.transpose((0, 2, 1))  # (B,C,T)
+    scores = Tensor((q.data @ kt.data) / np.sqrt(C), (q, kt), _op="att_scores")
+
+    def _backward_scores():
+        if q.grad is not None:
+            q.grad += (scores.grad @ kt.data) / np.sqrt(C)
+        if kt.grad is not None:
+            kt.grad += (np.transpose(q.data, (0, 2, 1)) @ scores.grad) / np.sqrt(C)
+
+    scores._backward = _backward_scores
+
+    # causal mask (no looking forward)
+    mask = np.triu(np.ones((T, T), dtype=bool), k=1)
+    masked = Tensor(np.where(mask[None, :, :], -1e9, scores.data), (scores,), _op="mask")
+
+    def _backward_mask():
+        if scores.grad is not None:
+            g = masked.grad.copy()
+            g[:, mask] = 0.0
+            scores.grad += g
+
+    masked._backward = _backward_mask
+
+    # softmax over last dim
+    att = softmax_tensor(masked.reshape(B * T, T), axis=1).reshape(B, T, T)
+
+    out = Tensor(att.data @ v.data, (att, v), _op="att_out")
+
+    def _backward_att_out():
+        if att.grad is not None:
+            att.grad += out.grad @ np.transpose(v.data, (0, 2, 1))
+        if v.grad is not None:
+            v.grad += np.transpose(att.data, (0, 2, 1)) @ out.grad
+
+    out._backward = _backward_att_out
+
+    proj = out @ Wo
+    return proj
+
+
+# -----------------------------
+# 4) Define model parameters
+# -----------------------------
+V = vocab_size
+T = block_size
+C = n_embd
+H = mlp_mult * C
+
+# embeddings
+E_tok = Tensor(randn((V, C)))
+E_pos = Tensor(randn((T, C)))
+
+# block params (1 layer; you can replicate this list for multiple layers)
+ln1_g = Tensor(np.ones((C,), dtype=np.float32))
+ln1_b = Tensor(np.zeros((C,), dtype=np.float32))
+ln2_g = Tensor(np.ones((C,), dtype=np.float32))
+ln2_b = Tensor(np.zeros((C,), dtype=np.float32))
+
+Wq = Tensor(randn((C, C)))
+Wk = Tensor(randn((C, C)))
+Wv = Tensor(randn((C, C)))
+Wo = Tensor(randn((C, C)))
+
+W1 = Tensor(randn((C, H)))
+b1 = Tensor(np.zeros((H,), dtype=np.float32))
+W2 = Tensor(randn((H, C)))
+b2 = Tensor(np.zeros((C,), dtype=np.float32))
+
+# final norm + head
+lnf_g = Tensor(np.ones((C,), dtype=np.float32))
+lnf_b = Tensor(np.zeros((C,), dtype=np.float32))
+W_vocab = Tensor(randn((C, V)))
+b_vocab = Tensor(np.zeros((V,), dtype=np.float32))
+
+params = [
+    E_tok, E_pos,
+    ln1_g, ln1_b, ln2_g, ln2_b,
+    Wq, Wk, Wv, Wo,
+    W1, b1, W2, b2,
+    lnf_g, lnf_b,
+    W_vocab, b_vocab
+]
+
+
+def zero_grads():
+    for p in params:
+        if p.grad is not None:
+            p.grad.fill(0.0)
+
+
+# -----------------------------
+# 5) Forward + loss
+# -----------------------------
+def token_lookup(E: Tensor, idx: np.ndarray):
+    # E: (V,C), idx: (B,T) => out (B,T,C)
+    out = Tensor(E.data[idx], (E,), _op="tok_lookup")
+
+    def _backward():
+        if E.grad is not None:
+            np.add.at(E.grad, idx.reshape(-1), out.grad.reshape(-1, C))
+
+    out._backward = _backward
+    return out
+
+
+def pos_lookup(Ep: Tensor, T_: int):
+    # returns (1,T,C)
+    ids = np.arange(T_)
+    out = Tensor(Ep.data[ids][None, :, :], (Ep,), _op="pos_lookup")
+
+    def _backward():
+        if Ep.grad is not None:
+            Ep.grad[ids] += out.grad[0]
+
+    out._backward = _backward
+    return out
+
+
+def transformer_block(x: Tensor):
+    # Pre-LN block: x = x + Attn(LN(x)); x = x + MLP(LN(x))
+    x = x + causal_self_attention_tensor(layer_norm_tensor(x, ln1_g, ln1_b), Wq, Wk, Wv, Wo)
+    x = x + (gelu_tensor((layer_norm_tensor(x, ln2_g, ln2_b) @ W1) + b1) @ W2 + b2)
+    return x
+
+
+def gpt_loss(xb: np.ndarray, yb: np.ndarray):
+    B, T_ = xb.shape
+
+    tok = token_lookup(E_tok, xb)      # (B,T,C)
+    pos = pos_lookup(E_pos, T_)        # (1,T,C)
+    x = tok + pos                      # (B,T,C)
+
+    # 1 block (you can loop n_layers times if you replicate per-layer params)
+    x = transformer_block(x)
+
+    x = layer_norm_tensor(x, lnf_g, lnf_b)
+    logits = (x @ W_vocab) + b_vocab   # (B,T,V)
+
+    logits2d = logits.reshape(B * T_, V)
+    targets = yb.reshape(B * T_)
+    loss = cross_entropy_tensor(logits2d, targets)
+    return loss
+
+
+# -----------------------------
+# 6) Training + evaluation
+# -----------------------------
+def estimate_loss(iters=50):
+    # small eval loop (no grad accumulation across calls)
+    out = {}
+    for split in ["train", "val"]:
+        losses = []
+        for _ in range(iters):
+            xb, yb = get_batch(split)
+            zero_grads()
+            loss = gpt_loss(xb, yb)
+            losses.append(float(loss.data))
+        out[split] = sum(losses) / len(losses)
+    return out
+
+
+print(f"vocab_size={vocab_size}, data_len={len(data)}")
+print("Starting training...")
+
+for step in range(steps):
+    xb, yb = get_batch("train")
+    zero_grads()
+    loss = gpt_loss(xb, yb)
+    loss.backward()
+
+    # SGD update
+    for p in params:
+        if p.grad is not None:
+            p.data -= lr * p.grad
+
+    if step % eval_every == 0:
+        losses = estimate_loss(iters=30)
+        print(f"step {step:5d} | train {losses['train']:.4f} | val {losses['val']:.4f}")
+
+print("Training done.")
+
+
+# -----------------------------
+# 7) Generation (inference, no grads)
+# -----------------------------
+def softmax_np(x, axis=-1):
+    x = x - np.max(x, axis=axis, keepdims=True)
+    ex = np.exp(x)
+    return ex / np.sum(ex, axis=axis, keepdims=True)
+
+def gpt_forward_inference(idx: np.ndarray):
+    # idx: (B, Tctx) token ids
+    B, Tctx = idx.shape
+    # truncate to last block_size tokens
+    if Tctx > block_size:
+        idx = idx[:, -block_size:]
+        Tctx = block_size
+
+    tok = E_tok.data[idx]                       # (B,Tctx,C)
+    pos = E_pos.data[np.arange(Tctx)][None,:,:] # (1,Tctx,C)
+    x = tok + pos                               # (B,Tctx,C)
+
+    # same 1 block forward (numpy only)
+    # LN1
+    def ln_forward(X, g, b, eps=1e-5):
+        mu = X.mean(axis=-1, keepdims=True)
+        var = ((X - mu)**2).mean(axis=-1, keepdims=True)
+        Xh = (X - mu) / np.sqrt(var + eps)
+        return Xh * g + b
+
+    # Attention
+    Xn = ln_forward(x, ln1_g.data, ln1_b.data)
+    q = Xn @ Wq.data
+    k = Xn @ Wk.data
+    v = Xn @ Wv.data
+    wei = (q @ np.transpose(k, (0,2,1))) / np.sqrt(C)
+    Tm = wei.shape[-1]
+    mask = np.triu(np.ones((Tm, Tm), dtype=bool), k=1)
+    wei = np.where(mask[None,:,:], -1e9, wei)
+    att = softmax_np(wei, axis=-1)
+    out = att @ v
+    out = out @ Wo.data
+    x = x + out
+
+    # MLP
+    Xn2 = ln_forward(x, ln2_g.data, ln2_b.data)
+    h = Xn2 @ W1.data + b1.data
+    # gelu approx
+    a = np.sqrt(2.0/np.pi)
+    u = a * (h + 0.044715 * h**3)
+    h = 0.5 * h * (1.0 + np.tanh(u))
+    h = h @ W2.data + b2.data
+    x = x + h
+
+    # final norm + head
+    x = ln_forward(x, lnf_g.data, lnf_b.data)
+    logits = x @ W_vocab.data + b_vocab.data   # (B,Tctx,V)
+    return logits
+
+def generate(start_text="", max_new_tokens=400, temperature=1.0):
+    if start_text == "":
+        idx = np.zeros((1,1), dtype=np.int64)
+    else:
+        idx = np.array([encode(start_text)], dtype=np.int64)
+
+    for _ in range(max_new_tokens):
+        logits = gpt_forward_inference(idx)          # (1,T,V)
+        last = logits[:, -1, :] / max(temperature, 1e-8)  # (1,V)
+        probs = softmax_np(last, axis=-1)[0]
+        next_id = rng.choice(vocab_size, p=probs)
+        idx = np.concatenate([idx, np.array([[next_id]], dtype=np.int64)], axis=1)
+
+    return decode(idx[0].tolist())
+
+print("\n--- SAMPLE ---")
+print(generate(start_text="", max_new_tokens=gen_new_tokens))
