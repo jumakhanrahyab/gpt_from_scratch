@@ -26,15 +26,11 @@ Most tutorials jump quickly between frameworks, abstractions, and environments, 
 
 This project intentionally takes the opposite approach:
 
-🔍 One idea at a time
-
-🧠 Why before how
-
-🧮 Math and shapes explicitly tracked
-
-⚙️ Minimal code, no magic
-
-🧱 Everything built from first principles
+- One idea at a time
+- Why before how
+- Math and shapes explicitly tracked
+- Minimal code, no magic
+- Everything built from first principles
 
 Where possible, components are first implemented conceptually (or in NumPy) before being expressed in PyTorch.
 
@@ -115,11 +111,9 @@ Producing coherent text
 
 What This Is Not
 
-❌ Not a production-ready GPT
-
-❌ Not an optimized or large-scale model
-
-❌ Not a framework tutorial
+- Not a production-ready GPT
+- Not an optimized or large-scale model
+- Not a framework tutorial
 
 This is a learning artifact, not a benchmark.
 
@@ -145,23 +139,8 @@ a conceptual bridge between math and modern NLP
 
 Who This Is For
 
-Learners who want to truly understand GPT
+- Learners who want to truly understand GPT
+- People frustrated by “black-box” tutorials
+- Anyone curious how attention actually works
+- Engineers who value first-principles thinking
 
-People frustrated by “black-box” tutorials
-
-Anyone curious how attention actually works
-
-Engineers who value first-principles thinking
-
-Repository Structure (example)
-chatgbt_from_scratch/
-├── nano_gpt_from_scratch.py
-├── README.md
-└── data/
-    └── tiny_shakespeare.txt
-
-Final Note
-
-If you can follow and understand this code, you will never see transformers as “magic” again.
-
-They’re just linear algebra — applied carefully, repeatedly, and at scale.
